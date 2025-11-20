@@ -1,0 +1,113 @@
+name: Build MangoPi MQ-R (Video VPU Support)
+
+on:
+  workflow_dispatch: # 手动触发
+
+env:
+  # 推荐使用 ImmortalWrt，因为它包含了最新的 T113 补丁和驱动
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  REPO_BRANCH: master
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install -y build-essential asciidoc binutils bzip2 gawk gettext git libncurses-dev libz-dev patch python3 python3-pip unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget swig rsync
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+
+    - name: Clone Source Code
+      run: |
+        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+        cd openwrt
+        # 更新 feeds 以获取最新的软件包
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Generate Configuration (T113 + VPU + WiFi)
+      working-directory: ./openwrt
+      run: |
+        # --- 1. 设置目标平台 (Allwinner T113) ---
+        echo "CONFIG_TARGET_sunxi=y" > .config
+        echo "CONFIG_TARGET_sunxi_cortexa7=y" >> .config
+        # 指定 MangoPi MQ-R 板型 (ImmortalWrt 通常支持这个名称)
+        echo "CONFIG_TARGET_sunxi_cortexa7_DEVICE_mangopi_mq-r=y" >> .config
+        
+        # --- 2. 启用视频硬件解码 (Cedrus VPU) ---
+        echo "CONFIG_PACKAGE_kmod-media=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-video-core=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-video-videobuf2-dma-contig=y" >> .config
+        # 核心驱动：全志 Cedrus 视频解码
+        echo "CONFIG_PACKAGE_kmod-video-cedrus=y" >> .config
+        # V4L2 Mem2Mem 框架支持
+        echo "CONFIG_PACKAGE_kmod-video-mem2mem=y" >> .config
+        
+        # --- 3. 安装视频工具 (用于测试) ---
+        # 安装 v4l-utils 用来查看 /dev/videoX 设备信息
+        echo "CONFIG_PACKAGE_v4l-utils=y" >> .config
+        # 安装 ffmpeg (完整版，尝试支持 v4l2_request)
+        echo "CONFIG_PACKAGE_ffmpeg=y" >> .config
+        echo "CONFIG_PACKAGE_ffprobe=y" >> .config
+
+        # --- 4. 启用 WiFi 驱动 (MQ-R 常见型号) ---
+        # RTL8189FS (MQ-R 单频版)
+        echo "CONFIG_PACKAGE_kmod-rtl8189fs=y" >> .config
+        # RTL8723DS (MQ-R 双频/蓝牙版)
+        echo "CONFIG_PACKAGE_kmod-rtl8723ds=y" >> .config
+        # 启用无线相关基础包
+        echo "CONFIG_PACKAGE_wpad-basic-wolfssl=y" >> .config
+        echo "CONFIG_PACKAGE_iwinfo=y" >> .config
+        
+        # --- 5. 其他基础设置 ---
+        echo "CONFIG_PACKAGE_luci=y" >> .config
+        echo "CONFIG_PACKAGE_htop=y" >> .config
+        echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
+        # T113 只有 USB 2.0，启用 USB 网络支持以备不时之需
+        echo "CONFIG_PACKAGE_kmod-usb-net-rndis=y" >> .config
+        
+        # --- 6. 应用并扩展配置 ---
+        export FORCE_UNSAFE_CONFIGURE=1
+        make defconfig
+        
+        # 检查是否回退到了默认平台 (如果 grep 找不到 sunxi，说明配置失败)
+        grep "CONFIG_TARGET_sunxi=y" .config || (echo "Error: Target setup failed!" && exit 1)
+
+    - name: Download Packages
+      working-directory: ./openwrt
+      run: |
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile Firmware
+      working-directory: ./openwrt
+      run: |
+        echo -e "$(nproc) thread compile"
+        export FORCE_UNSAFE_CONFIGURE=1
+        make -j$(nproc) || make -j1 V=s
+
+    - name: Organize Output
+      if: success()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+
+    - name: Upload Firmware
+      uses: actions/upload-artifact@v4
+      if: success()
+      with:
+        name: OpenWrt-MangoPi-MQR-VPU
+        path: ${{ env.FIRMWARE_PATH }}
